@@ -1,7 +1,7 @@
 use itertools::{EitherOrBoth, Itertools};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 #[derive(Debug)]
@@ -43,7 +43,7 @@ struct NodePath<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Existence {
+pub enum Existence {
     Undefined,
     Defined { hash: u64 },
 }
@@ -81,13 +81,13 @@ struct KeySlice<'a> {
 
 impl<'a> std::fmt::Display for KeySlice<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for segment in Itertools::intersperse(self.inner.iter(), &Key::Object("/")) {
+        for segment in self.inner.iter() {
             match segment {
                 Key::Object(x) => {
-                    write!(f, "{x}")?;
+                    write!(f, "/{x}")?;
                 }
                 Key::Array(x) => {
-                    write!(f, "{x}")?;
+                    write!(f, "/{x}")?;
                 }
             }
         }
@@ -131,7 +131,7 @@ trait ApplyPatch {
         T: DiffHook<'a>,
     {
         hook.replay()
-            .filter_map(|op| match self.apply_op(op) {
+            .filter_map(|op| match self.apply_op(dbg!(op)) {
                 Err(m) => Some(m),
                 Ok(()) => None,
             })
@@ -141,7 +141,8 @@ trait ApplyPatch {
     fn apply_op(&mut self, op: Op<'_>) -> Result<(), MergingError>;
 }
 
-enum MergingError {
+#[derive(Debug)]
+pub enum MergingError {
     /// this JSON pointer cant be found in the targe object
     PathNotFound(String),
     /// this value found at this path was unexpected
@@ -161,7 +162,8 @@ fn val_at_key_slice_mut<'a>(
 ) -> Result<&'a mut Value, MergingError> {
     let idx = path.inner.len().saturating_sub(reverse_index);
     let ptr = path.slice_to(idx).to_pointer();
-    val.pointer_mut(&ptr).ok_or(MergingError::PathNotFound(ptr))
+    dbg!(&val);
+    dbg!(val.pointer_mut(&ptr)).ok_or(MergingError::PathNotFound(ptr))
 }
 
 /// attempts to replace this path on the passed [Value]
@@ -330,7 +332,11 @@ impl<'a> Diff<'a, Value> for ValuePath<'a> {
                 | Value::Array(_)
                 | Value::Object(_),
             ) => replace(self.value, new, hook),
-            (Value::Bool(_), Value::Bool(_)) => {}
+            (Value::Bool(old_bool), Value::Bool(new_bool)) => {
+                if old_bool != new_bool {
+                    replace(self.value, new, hook)
+                }
+            }
             (
                 Value::Bool(_),
                 Value::Null
@@ -339,7 +345,11 @@ impl<'a> Diff<'a, Value> for ValuePath<'a> {
                 | Value::Array(_)
                 | Value::Object(_),
             ) => replace(self.value, new, hook),
-            (Value::Number(_), Value::Number(_)) => {}
+            (Value::Number(old_num), Value::Number(new_num)) => {
+                if old_num != new_num {
+                    replace(self.value, new, hook)
+                }
+            }
             (
                 Value::Number(_),
                 Value::Null
@@ -348,7 +358,11 @@ impl<'a> Diff<'a, Value> for ValuePath<'a> {
                 | Value::Array(_)
                 | Value::Object(_),
             ) => replace(self.value, new, hook),
-            (Value::String(_), Value::String(_)) => {}
+            (Value::String(old_str), Value::String(new_str)) => {
+                if old_str != new_str {
+                    replace(self.value, new, hook)
+                }
+            }
             (
                 Value::String(_),
                 Value::Null
@@ -427,7 +441,10 @@ impl<T> Access<T> {
     {
         let raw_json: Value = serde_json::from_str(s)?;
         let extracted: T = serde_json::from_str(s)?;
+        Self::verify(extracted, raw_json)
+    }
 
+    fn verify(extracted: T, raw_json: Value) -> Result<Access<T>, DestroyNothingError> {
         if !matches!(raw_json, Value::Object(_)) {
             return Err(DestroyNothingError::NotAContainer);
         }
@@ -438,12 +455,22 @@ impl<T> Access<T> {
         })
     }
 
+    pub fn new_from_value<'a>(v: Value) -> Result<Access<T>, DestroyNothingError>
+    where
+        T: DeserializeOwned,
+    {
+        let extraced: T = serde_json::from_value(v.clone())?;
+        Self::verify(extraced, v)
+    }
+
     pub fn diff(self, new: T) -> Result<MergeSummary, DestroyNothingError>
     where
         T: Serialize,
     {
         let old_entries = serde_json::value::to_value(self.extracted)?;
         let new_entries = serde_json::value::to_value(new)?;
+
+        dbg!(&new_entries);
 
         let cur = ValuePath::root(&old_entries);
         let mut hook = DiffHookImpl::default();
@@ -455,6 +482,12 @@ impl<T> Access<T> {
             value: to_modify,
             errors,
         })
+    }
+}
+
+impl<T> AsRef<T> for Access<T> {
+    fn as_ref(&self) -> &T {
+        &self.extracted
     }
 }
 
@@ -510,196 +543,89 @@ impl<'a> KeySummary<&'a str, &'a Value> for &'a Map<String, Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    static item_a: &'static str = r#"{
-  "overview": {
-    "title": "Server",
-    "ainfo": "username"
-  },
-  "details": {
-    "sections": [
-      {
-        "name": "",
-        "title": "",
-        "fields": [
-          {
-            "t": "URL",
-            "n": "url",
-            "k": "string",
-            "inputTraits": {
-              "keyboard": "URL"
-            }
-          },
-          {
-            "t": "username",
-            "n": "username",
-            "k": "string",
-            "inputTraits": {
-              "autocorrection": "no",
-              "autocapitalization": "none"
-            },
-            "v": "username"
-          },
-          {
-            "t": "password",
-            "n": "password",
-            "k": "concealed",
-            "v": "password"
-          },
-          {
-            "t": "password",
-            "n": "v4pljk3gpw4mg7l2nnwazhiyvm",
-            "k": "concealed",
-            "v": "secondpassword",
-            "inputTraits": {
-              "autocorrection": "no",
-              "autocapitalization": "none"
-            }
-          }
-        ]
-      },
-      {
-        "name": "admin_console",
-        "title": "Admin Console",
-        "fields": [
-          {
-            "t": "admin console URL",
-            "n": "admin_console_url",
-            "k": "string",
-            "inputTraits": {
-              "keyboard": "URL"
-            }
-          },
-          {
-            "t": "admin console username",
-            "n": "admin_console_username",
-            "k": "string",
-            "inputTraits": {
-              "autocorrection": "no",
-              "autocapitalization": "none"
-            }
-          },
-          {
-            "t": "console password",
-            "n": "admin_console_password",
-            "k": "concealed"
-          }
-        ]
-      },
-      {
-        "name": "hosting_provider_details",
-        "title": "Hosting Provider",
-        "fields": [
-          {
-            "t": "name",
-            "n": "name",
-            "k": "string",
-            "inputTraits": {
-              "autocapitalization": "Words"
-            }
-          },
-          {
-            "t": "website",
-            "n": "website",
-            "k": "string",
-            "inputTraits": {
-              "keyboard": "URL"
-            }
-          },
-          {
-            "t": "support URL",
-            "n": "support_contact_url",
-            "k": "string",
-            "inputTraits": {
-              "keyboard": "URL"
-            }
-          },
-          {
-            "t": "support phone",
-            "n": "support_contact_phone",
-            "k": "string",
-            "inputTraits": {
-              "keyboard": "NamePhonePad"
-            }
-          }
-        ]
-      }
-    ]
-  },
-  "createdAt": "2024-09-06T14:12:21Z",
-  "updatedAt": "2024-09-06T17:23:47Z",
-  "faveIndex": 0,
-  "trashed": "N",
-  "templateUuid": "110",
-  "uuid": "3sxlf7itisprwr63rs2nkzhpi4"
-}"#;
+    use serde_json::json;
 
-    static item_b: &'static str = r#"{
-  "overview": {
-    "title": "Login",
-    "ainfo": "test",
-    "ps": 6,
-    "url": "https://*.google.com",
-    "URLs": [
-      {
-        "u": "https://*.google.com",
-        "l": "website",
-        "m": "default"
-      }
-    ]
-  },
-  "details": {
-    "fields": [
-      {
-        "value": "test",
-        "id": "",
-        "name": "username",
-        "type": "T",
-        "designation": "username"
-      },
-      {
-        "value": "test1",
-        "id": "",
-        "name": "password",
-        "type": "P",
-        "designation": "password"
-      }
-    ],
-    "notesPlain": "something",
-    "passwordHistory": [
-      {
-        "value": "test",
-        "time": 1719515490
-      },
-      {
-        "value": "test",
-        "time": 1719515513
-      },
-      {
-        "value": "test",
-        "time": 1719516194
-      },
-      {
-        "value": "test",
-        "time": 1719521497
-      }
-    ]
-  },
-  "createdAt": "2024-04-09T21:50:33Z",
-  "updatedAt": "2024-06-27T20:51:37Z",
-  "faveIndex": 0,
-  "trashed": "N",
-  "templateUuid": "001",
-  "uuid": "qmutr7cwhhgln2yhhah2qs6uy4"
-}"#;
+    use super::*;
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    struct My<T> {
+        my: T,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    struct Deeply<T> {
+        deeply: T,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    struct Nested<T> {
+        nested: T,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    struct Obj<T> {
+        obj: T,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    enum Color {
+        Blue,
+        Green,
+        Red,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[serde(tag = "type", content = "content")]
+    enum Lights {
+        On(Color),
+        Off,
+    }
+
+    fn future_data() -> Value {
+        json!({
+            "my": {
+                "deeply": {
+                    "nested": {
+                        "obj": {
+                            "type": "On",
+                            "content": "Blue"
+                        }
+                    },
+                    "unknown": [1,2,3]
+                },
+                "future": 43
+            },
+            "something": true
+        })
+    }
 
     #[test]
     fn it_should_compare() {
-        let access: Access<Value> = Access::new(item_a).unwrap();
+        let access =
+            Access::<My<Deeply<Nested<Obj<Lights>>>>>::new_from_value(future_data()).unwrap();
 
-        let other: Value = serde_json::from_str(item_b).unwrap();
+        let mut to_modify = access.as_ref().clone();
 
-        access.diff(other);
-        panic!("test");
+        to_modify.my.deeply.nested.obj = Lights::Off;
+
+        let MergeSummary { value, errors } = access.diff(to_modify).unwrap();
+        dbg!(errors);
+        assert_eq!(
+            value,
+            json!({
+                "my": {
+                    "deeply": {
+                        "nested": {
+                            "obj": {
+                                "type": "Off",
+                            }
+                        },
+                        "unknown": [1,2,3]
+                    },
+                    "future": 43
+                },
+                "something": true
+            })
+        )
     }
 }
