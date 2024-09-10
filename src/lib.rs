@@ -1,8 +1,5 @@
 use itertools::{EitherOrBoth, Itertools};
-use std::{
-    borrow::Borrow,
-    hash::{DefaultHasher, Hash, Hasher},
-};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -28,64 +25,10 @@ impl From<serde_json::Error> for DestroyNothingError {
     }
 }
 
-/// wrapper around a JSON object
-struct JsonContainer(Map<String, Value>);
-
-#[derive(PartialEq, Eq, Debug, Hash)]
-struct Entry<K, V> {
-    key: K,
-    value: V,
-}
-
-impl JsonContainer {
-    fn entries(&self) -> impl Iterator<Item = Entry<&'_ str, &'_ Value>> + '_ {
-        self.0.iter().map(|(k, v)| Entry {
-            key: k.as_str(),
-            value: v,
-        })
-    }
-
-    fn into_entries(self) -> impl Iterator<Item = Entry<String, Value>> {
-        self.0.into_iter().map(|(key, value)| Entry { key, value })
-    }
-}
-
-impl<K, V> PartialOrd for Entry<K, V>
-where
-    K: Borrow<str>,
-    K: Eq,
-    V: Eq,
-{
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.key.borrow().cmp(other.key.borrow()))
-    }
-}
-
-impl<K, V> Ord for Entry<K, V>
-where
-    K: Borrow<str>,
-    K: Eq,
-    V: Eq,
-{
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
-    }
-}
-
 trait Diff<'a, Rhs = Self> {
     fn diff<D>(&self, other: &'a Rhs, hook: &mut D) -> Result<(), DestroyNothingError>
     where
         D: DiffHook<'a>;
-}
-
-impl JsonContainer {
-    fn new_from_value(val: Value) -> Result<Self, DestroyNothingError> {
-        let Value::Object(o) = val else {
-            return Err(DestroyNothingError::NotAContainer);
-        };
-
-        Ok(Self(o))
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,9 +44,8 @@ struct NodePath<'a> {
 
 #[derive(Debug, Clone, Copy)]
 enum Existence {
-    Defined,
     Undefined,
-    DefinedWithHash(u64),
+    Defined { hash: u64 },
 }
 
 impl<'a> NodePath<'a> {
@@ -237,16 +179,14 @@ fn replace_value_mut(
     let mut_val = val_at_key_slice_mut(path, val, 1)?;
     match (mut_val, path.inner.last()) {
         (Value::Array(a), Some(Key::Array(n))) => match (expect, a.get(*n)) {
-            (Existence::Undefined, Some(_))
-            | (Existence::Defined, None)
-            | (Existence::DefinedWithHash(_), None) => {
+            (Existence::Undefined, Some(_)) | (Existence::Defined { .. }, None) => {
                 return Err(MergingError::UnexpectedValue {
                     path: path.slice().to_pointer(),
                     expected: expect,
                 });
             }
 
-            (Existence::DefinedWithHash(hash), Some(x)) => {
+            (Existence::Defined { hash }, Some(x)) => {
                 let this_hash = hash_val(x);
                 match hash == this_hash {
                     true => {
@@ -261,20 +201,18 @@ fn replace_value_mut(
                     }
                 }
             }
-            (Existence::Defined, Some(_)) | (Existence::Undefined, None) => {
+            (Existence::Undefined, None) => {
                 a.insert(*n, replace_with.clone());
             }
         },
         (Value::Object(o), Some(Key::Object(s))) => match (expect, o.get(*s)) {
-            (Existence::Undefined, Some(_))
-            | (Existence::Defined, None)
-            | (Existence::DefinedWithHash(_), None) => {
+            (Existence::Undefined, Some(_)) | (Existence::Defined { .. }, None) => {
                 return Err(MergingError::UnexpectedValue {
                     path: path.slice().to_pointer(),
                     expected: expect,
                 });
             }
-            (Existence::DefinedWithHash(hash), Some(x)) => {
+            (Existence::Defined { hash }, Some(x)) => {
                 let this_hash = hash_val(x);
                 match hash == this_hash {
                     true => {
@@ -289,7 +227,7 @@ fn replace_value_mut(
                     }
                 }
             }
-            (Existence::Undefined, None) | (Existence::Defined, Some(_)) => {
+            (Existence::Undefined, None) => {
                 o.insert(s.to_string(), replace_with.clone());
             }
         },
@@ -326,7 +264,7 @@ impl ApplyPatch for Value {
                 }
             }
             Op::Replace { path, data, hash } => {
-                replace_value_mut(&path, self, data, Existence::DefinedWithHash(hash))
+                replace_value_mut(&path, self, data, Existence::Defined { hash })
             }
         }
     }
